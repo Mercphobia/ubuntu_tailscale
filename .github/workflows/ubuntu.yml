@@ -59,8 +59,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             openssh-server tmux git curl make nano unzip bc bison \
             build-essential cmake flex libelf-dev libssl-dev lld \
-            ninja-build texinfo xz-utils zlib1g-dev ccache python3-pip
+            ninja-build texinfo xz-utils zlib1g-dev ccache python3-pip mosh locales
           sudo apt-get clean
+          sudo locale-gen en_US.UTF-8 || true
+          sudo update-locale LANG=en_US.UTF-8 || true
 
           df -h /
           free -h
@@ -195,7 +197,7 @@ jobs:
           HAD_SESSION=0
 
           while [ "$SECONDS" -lt "$END" ]; do
-            ACTIVE=$(pgrep -f "sshd: runner@" | wc -l)
+            ACTIVE=$(pgrep -f "sshd: runner@|mosh-server" | wc -l)
 
             if [ "$ACTIVE" -gt 0 ]; then
               HAD_SESSION=1
@@ -223,4 +225,3 @@ jobs:
           path: /home/runner/out/
           if-no-files-found: ignore
           retention-days: 7
-          
