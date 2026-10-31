@@ -1,0 +1,226 @@
+name: Ubuntu
+
+# Taruh di: .github/workflows/ubuntu.yml  (repo PRIVATE)
+#
+# Pilih tunnel saat Run workflow: tailscale (default) atau ngrok.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   SSH_PUBLIC_KEY   : isi file ~/.ssh/id_ed25519.pub kamu (wajib)
+#   TS_AUTHKEY       : auth key Tailscale, Reusable + Ephemeral (wajib kalau mode tailscale)
+#   NGROK_AUTHTOKEN  : authtoken ngrok (wajib kalau mode ngrok)
+#   GIT_NAME         : nama untuk git commit (opsional)
+#   GIT_EMAIL        : email untuk git commit (opsional)
+#   GH_PAT           : token GitHub scope sempit buat push (opsional)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel:
+        description: 'Jenis tunnel'
+        type: choice
+        default: tailscale
+        options:
+          - tailscale
+          - ngrok
+      timeout_minutes:
+        description: 'Durasi sesi maksimal (menit, batas GitHub ~360)'
+        required: false
+        default: '340'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TUNNEL: ${{ github.event.inputs.tunnel || 'tailscale' }}
+      TIMEOUT_MIN: ${{ github.event.inputs.timeout_minutes || '340' }}
+
+    steps:
+      - name: Free disk, add swap, install tools
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell 2>/dev/null || true
+          sudo docker system prune --all --force --volumes 2>/dev/null || true
+
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            openssh-server tmux git curl make nano unzip bc bison \
+            build-essential cmake flex libelf-dev libssl-dev lld \
+            ninja-build texinfo xz-utils zlib1g-dev ccache python3-pip
+          sudo apt-get clean
+
+          df -h /
+          free -h
+
+      - name: Configure runner user (SSH key, tmux, git)
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          GIT_NAME: ${{ secrets.GIT_NAME }}
+          GIT_EMAIL: ${{ secrets.GIT_EMAIL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "Secret SSH_PUBLIC_KEY belum diisi." ; exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+          cat > ~/.tmux.conf <<'EOF'
+          set -g mouse on
+          set -g history-limit 50000
+          set -g default-terminal "xterm-256color"
+          EOF
+
+          # auto-attach tmux saat login interaktif
+          cat >> ~/.bash_profile <<'EOF'
+          [ -f ~/.bashrc ] && . ~/.bashrc
+          if [[ $- == *i* ]] && [ -t 0 ] && [ -z "$TMUX" ]; then
+              tmux new-session -A -s main
+          fi
+          EOF
+
+          [ -n "$GIT_NAME" ]  && git config --global user.name  "$GIT_NAME"
+          [ -n "$GIT_EMAIL" ] && git config --global user.email "$GIT_EMAIL"
+
+          if [ -n "$GH_PAT" ]; then
+            git config --global credential.helper store
+            printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" \
+              > ~/.git-credentials
+            chmod 600 ~/.git-credentials
+          fi
+
+      - name: Configure sshd (key only)
+        run: |
+          sudo mkdir -p /var/run/sshd
+          {
+            echo "PasswordAuthentication no"
+            echo "KbdInteractiveAuthentication no"
+            echo "PermitRootLogin no"
+            echo "AllowUsers runner"
+            echo "ClientAliveInterval 30"
+            echo "ClientAliveCountMax 10"
+          } | sudo tee /etc/ssh/sshd_config.d/00-runner.conf > /dev/null
+          sudo service ssh restart
+          sudo sshd -T | grep -Ei 'passwordauthentication|allowusers'
+          ss -tlnp | grep ':22' || { echo "sshd tidak listen di port 22"; exit 1; }
+
+      - name: Open tunnel and keep session alive
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          set +e
+
+          if [ "$TUNNEL" = "tailscale" ]; then
+            if [ -z "$TS_AUTHKEY" ]; then
+              echo "Secret TS_AUTHKEY belum diisi." ; exit 1
+            fi
+
+            curl -fsSL https://tailscale.com/install.sh | sudo sh
+            sudo tailscale up \
+              --authkey="$TS_AUTHKEY" \
+              --hostname="gh-runner-${GITHUB_RUN_ID}" \
+              --accept-dns=false
+
+            TS_IP=$(tailscale ip -4 | head -1)
+            if [ -z "$TS_IP" ]; then
+              echo "Tailscale gagal dapat IP. Cek auth key (reusable/ephemeral, belum expired)."
+              sudo tailscale status
+              exit 1
+            fi
+
+            echo "=================================================="
+            echo "Connect:  ssh runner@${TS_IP}"
+            echo "     atau ssh runner@gh-runner-${GITHUB_RUN_ID}  (kalau MagicDNS aktif)"
+            echo "Auth   :  SSH key (tidak ada password)"
+            echo "Syarat :  device kamu login ke tailnet yang sama"
+            echo "Durasi :  ${TIMEOUT_MIN} menit"
+            echo "=================================================="
+
+          elif [ "$TUNNEL" = "ngrok" ]; then
+            if [ -z "$NGROK_AUTHTOKEN" ]; then
+              echo "Secret NGROK_AUTHTOKEN belum diisi." ; exit 1
+            fi
+
+            curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+              | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc > /dev/null
+            echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+              | sudo tee /etc/apt/sources.list.d/ngrok.list
+            sudo apt-get update -y
+            sudo apt-get install -y ngrok
+            ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+
+            nohup ngrok tcp 22 --log stdout > /tmp/ngrok.log 2>&1 &
+
+            ADDR=""
+            for i in $(seq 1 20); do
+              sleep 2
+              ADDR=$(curl -s http://127.0.0.1:4040/api/tunnels \
+                | grep -o '"public_url":"tcp://[^"]*' | cut -d'/' -f3)
+              [ -n "$ADDR" ] && break
+            done
+
+            if [ -z "$ADDR" ]; then
+              echo "ngrok gagal. Cek authtoken, kartu terverifikasi, dan kuota:"
+              tail -n 30 /tmp/ngrok.log
+              exit 1
+            fi
+
+            echo "=================================================="
+            echo "Connect:  ssh runner@${ADDR%%:*} -p ${ADDR##*:}"
+            echo "Auth   :  SSH key (tidak ada password)"
+            echo "Durasi :  ${TIMEOUT_MIN} menit"
+            echo "=================================================="
+          else
+            echo "Tunnel tidak dikenal: $TUNNEL" ; exit 1
+          fi
+
+          END=$(( SECONDS + TIMEOUT_MIN * 60 ))
+          HAD_SESSION=0
+
+          while [ "$SECONDS" -lt "$END" ]; do
+            ACTIVE=$(pgrep -f "sshd: runner@" | wc -l)
+
+            if [ "$ACTIVE" -gt 0 ]; then
+              HAD_SESSION=1
+            elif [ "$HAD_SESSION" -eq 1 ] && ! tmux has-session -t main 2>/dev/null; then
+              echo "SSH putus dan tmux selesai. Mengakhiri workflow."
+              break
+            fi
+            sleep 5
+          done
+
+          echo "Sesi selesai."
+
+          # lepas node dari tailnet supaya langsung hilang dari daftar device
+          if [ "$TUNNEL" = "tailscale" ]; then
+            sudo tailscale logout || true
+          fi
+
+      # Opsional: simpan hasil build (mis. kernel) sebelum VM hilang.
+      # Taruh file hasil di ~/out, nanti otomatis di-upload saat sesi berakhir.
+      - name: Upload artifacts from ~/out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: /home/runner/out/
+          if-no-files-found: ignore
+          retention-days: 7
+          
